@@ -32,6 +32,19 @@ KNOWN_SYMPTOMS = {
     "abdominal pain",
 }
 
+KNOWN_MEDICATIONS = {
+    "metformin",
+    "aspirin",
+    "ibuprofen",
+    "paracetamol",
+    "acetaminophen",
+    "lisinopril",
+    "amlodipine",
+    "atorvastatin",
+    "insulin",
+    "omeprazole",
+}
+
 
 def normalize_text(text: str) -> str:
     return " ".join(text.lower().split()).strip(".,;:()[]{}\"'")
@@ -50,11 +63,7 @@ def unique_keep_order(items):
     return output
 
 
-def expand_medication_span(clinical_note: str, start: int, end: int) -> str:
-    """
-    Expand a partial medication token like 'met' to 'metformin'
-    by growing left/right through valid medication characters.
-    """
+def expand_token_span(clinical_note: str, start: int, end: int) -> str:
     if start is None or end is None:
         return ""
 
@@ -76,17 +85,71 @@ def expand_medication_span(clinical_note: str, start: int, end: int) -> str:
 def clean_entity_text(clinical_note: str, item: dict) -> str:
     start = item.get("start")
     end = item.get("end")
-    entity_group = item.get("entity_group", "").strip().lower()
 
-    if entity_group == "medication" and start is not None and end is not None:
-        expanded = expand_medication_span(clinical_note, start, end)
+    if start is not None and end is not None:
+        expanded = expand_token_span(clinical_note, start, end)
         if expanded:
             return expanded
 
-    if start is not None and end is not None and 0 <= start < end <= len(clinical_note):
-        return clinical_note[start:end].strip()
-
     return item.get("word", "").strip()
+
+
+def apply_fallback_rules(clinical_note: str, medications: list, symptoms: list, diagnoses: list):
+    note_lower = clinical_note.lower()
+
+    med_norms = [normalize_text(x) for x in medications]
+    sym_norms = [normalize_text(x) for x in symptoms]
+    diag_norms = [normalize_text(x) for x in diagnoses]
+
+    for med in KNOWN_MEDICATIONS:
+        if med in note_lower and med not in med_norms:
+            medications.append(med)
+            med_norms.append(med)
+
+    for sym in KNOWN_SYMPTOMS:
+        if sym in note_lower and sym not in sym_norms:
+            symptoms.append(sym)
+            sym_norms.append(sym)
+
+    for diag in KNOWN_DIAGNOSES:
+        if diag in note_lower and diag not in diag_norms:
+            diagnoses.append(diag)
+            diag_norms.append(diag)
+
+    return medications, symptoms, diagnoses
+
+
+def remove_fragmented_terms(items, known_terms):
+    """
+    Remove junk fragments like 'di' or 'zziness' if the full known term
+    (e.g. 'dizziness') is also present.
+    """
+    norm_items = [normalize_text(x) for x in items]
+    cleaned = []
+
+    for item in items:
+        item_norm = normalize_text(item)
+
+        # Keep if it is a known term
+        if item_norm in known_terms:
+            cleaned.append(item)
+            continue
+
+        # Drop very short fragments
+        if len(item_norm) <= 3:
+            continue
+
+        # Drop if this fragment is part of a full known term already present
+        is_fragment = False
+        for term in known_terms:
+            if item_norm != term and item_norm in term and term in norm_items:
+                is_fragment = True
+                break
+
+        if not is_fragment:
+            cleaned.append(item)
+
+    return unique_keep_order(cleaned)
 
 
 def extract_entities_with_bert(clinical_note: str):
@@ -111,7 +174,7 @@ def extract_entities_with_bert(clinical_note: str):
             "text": entity_text,
             "normalized_text": entity_text_norm,
             "entity_group": entity_group,
-            "score": item.get("score"),
+            "score": float(item.get("score")) if item.get("score") is not None else None,
             "start": item.get("start"),
             "end": item.get("end"),
         })
@@ -122,8 +185,6 @@ def extract_entities_with_bert(clinical_note: str):
         elif entity_group_lower in {"sign_symptom", "symptom"}:
             if entity_text_norm in KNOWN_DIAGNOSES:
                 diagnoses.append(entity_text)
-            elif entity_text_norm in KNOWN_SYMPTOMS:
-                symptoms.append(entity_text)
             else:
                 symptoms.append(entity_text)
 
@@ -133,6 +194,17 @@ def extract_entities_with_bert(clinical_note: str):
     medications = unique_keep_order(medications)
     symptoms = unique_keep_order(symptoms)
     diagnoses = unique_keep_order(diagnoses)
+
+    medications, symptoms, diagnoses = apply_fallback_rules(
+        clinical_note,
+        medications,
+        symptoms,
+        diagnoses
+    )
+
+    medications = remove_fragmented_terms(medications, KNOWN_MEDICATIONS)
+    symptoms = remove_fragmented_terms(symptoms, KNOWN_SYMPTOMS)
+    diagnoses = remove_fragmented_terms(diagnoses, KNOWN_DIAGNOSES)
 
     return {
         "clinical_note": clinical_note,
